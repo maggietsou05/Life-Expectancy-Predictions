@@ -1,0 +1,1004 @@
+---
+title: "Predicting Life Expectancy Under Multicollinearity: A Comparison of Principal Component Regression and Elastic Net Regularization"
+author: "Maggie Tsou"
+date: "Oct, 2025"
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{makecell}
+  - \usepackage{placeins}
+output:
+  pdf_document:
+    fig_caption: yes
+    citation_package: natbib
+subtitle: FEM11149 - Introduction to Data Science
+editor_options:
+  chunk_output_type: inline
+urlcolor: blue
+linkcolor: red
+bibliography: references.bib
+---
+
+# Introduction
+Life expectancy is a fundamental indicator of population health and socioeconomic development, reflecting the effects of health services, living conditions, and national resources [@Martinez2021]. The prediction of which is crucial for resource allocation decisions and to help prioritize actions that most effectively improve outcomes across diverse regions, though it is complicated by the fact that many health, economic, and demographic indicators are highly correlated; therefore, standard regression methods may fail to give an accurate prediction. This study explores how predictive modeling techniques can best capture the complex, interdependent drivers of life expectancy in each country. Specifically, it asks whether summarizing correlated health indicators through Principal Component Regression or selectively penalizing them through Elastic Net regularization yields more accurate and interpretable predictions. 
+
+```{r setup, message = FALSE, warning = FALSE, echo = FALSE, results='hide'}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(corrplot)
+library(naniar)
+library(knitr)
+library(car)
+library(lmtest)
+library(pls)
+library(reshape2)
+library(e1071)
+library(glmnet)
+
+knitr::opts_chunk$set(fig.pos = "H")
+health_data <- read.csv("health_nutrition_population.csv", stringsAsFactors = FALSE)
+life_exp <- read.csv("life_expectancy_data-1.csv", stringsAsFactors = FALSE)
+predictions_data <- read.csv("predictions-1.csv", stringsAsFactors = FALSE)
+```
+
+# Data
+
+The dataset, compiled from the World Health Organization and World Bank, contains observations for 160 countries and 28 indicators describing health, demographic, and socioeconomic conditions, with life expectancy as the dependent variable. Health indicators include total, government, private, and out-of-pocket health expenditure per capita; prevalence of diabetes and hypertension; and tuberculosis incidence, mortality, and treatment success rate. Immunization coverage is measured for DPT, HepB3, Hib3, measles, and Pol3 vaccines, alongside total alcohol consumption per capita. Demographic and nutrition-related indicators comprise fertility rate and prevalence of overweight adults. Population and economic variables include total and urban population, population growth, rural population, labor force participation, unemployment rate, sex ratio at birth, net migration, access to basic drinking water and sanitation, and gross national income per capita. Each variable represents the most recent available observation for each country, and missing data were addressed systematically during preprocessing.
+
+
+```{r cleaning, message = FALSE, warning = FALSE, echo = FALSE, results='hide'}
+life_exp <- life_exp %>% select(-1) 
+predictions_data <- predictions_data %>% select(-1) 
+
+names(health_data) <- trimws(names(health_data))
+names(life_exp) <- trimws(names(life_exp))
+names(predictions_data) <- trimws(names(predictions_data))
+
+names(life_exp)[2] <- "LifeExpectancy"
+
+# merge by country name
+full_data <- inner_join(health_data, life_exp, by = "Country")
+life_exp[1]
+health_data[1]
+
+cat("countries retained:", nrow(full_data), ", dropped", 
+    nrow(life_exp) - nrow(full_data))
+
+col_names <- c(
+  "Country",
+  "FertilityRate",
+  "HealthExpenditure",
+  "DiabetesPrevalence",
+  "GovHealthExpend",
+  "PrivHealthExpend",
+  "GNI_PerCapita",
+  "Immunization_DPT",
+  "Immunization_HepB3",
+  "Immunization_Hib3",
+  "Immunization_Measles",
+  "Immunization_Pol3",
+  "TB_Incidence",
+  "LaborForce",
+  "NetMigration",
+  "OutOfPocket_Expend",
+  "BasicWater",
+  "BasicSanitation",
+  "PopulationGrowth",
+  "Population_Total",
+  "Overweight_Prev",
+  "Hypertension_Prev",
+  "RuralPopulation",
+  "SexRatio_Birth",
+  "AlcoholConsumption",
+  "TB_DeathRate",
+  "TB_TreatmentSuccess",
+  "Unemployment",
+  "UrbanPopGrowth",
+  "UrbanPopulation",
+  "LifeExpectancy"
+)
+
+colnames(full_data) <- col_names
+
+predictor_names <- setdiff(col_names, "LifeExpectancy")
+colnames(predictions_data) <- predictor_names
+
+str(full_data)
+summary(full_data)
+```
+
+# Methodology
+
+To make sure that model performance could be evaluated on unseen data and to mitigate overfitting, this dataset is randomly divided into training (80%, n = 128) and test (20%, n = 32). Imputation with the median (due to its robustness to outliers) is then used to handle missing values that were mostly present in small nations. Next, diagnostic tests were conducted to assess multicollinearity, skewness, and linearity. Logarithmic transformations were applied to continuous right-skewed variables and logit transformations to bounded percentage variables to adjust for the latter two diagnostic tests. Two complementary regression approaches are implemented to address the remaining multicollinearity. Principal Component Regression (PCR) reduces multicollinearity by constructing uncorrelated linear combinations of predictors that capture the dominant variance structure in the data. The optimal number of components is determined using Kaiser’s rule, cumulative variance thresholds, scree-plot analysis, and a permutation test evaluating whether retained components explain more variance than expected by chance, with bootstrap resampling (1,000 iterations) validating component stability. Elastic Net regression is chosen for its ability to combine L1 and L2 penalties, and the tuning parameters alpha and lambda (min and 1se) are optimized to minimize prediction error. Model performance on the test data was evaluated using RMSE, MAE, and R², which together quantify overall accuracy, typical deviation, and explained variance. Stability across income levels were also considered in the selection of the final model to predict life expectancy for 3 different countries.
+
+```{r na-cleaning, message = FALSE, warning = FALSE, echo = FALSE, results='hide'}
+set.seed(100) 
+
+train_index <- sample(1:nrow(full_data), 0.8 * nrow(full_data))
+
+train_data <- full_data[train_index, ]
+test_data <- full_data[-train_index, ]
+
+cat("Training set:", nrow(train_data))
+cat("Test set:", nrow(test_data))
+
+numeric_cols <- sapply(train_data, is.numeric)
+numeric_cols["LifeExpectancy"] <- FALSE 
+
+# calculate median
+train_medians <- list()
+for(col in names(train_data)[numeric_cols]) {
+  if(sum(is.na(train_data[[col]])) > 0) {
+    train_medians[[col]] <- median(train_data[[col]], na.rm = TRUE)
+  }
+}
+# impute train
+for(col in names(train_medians)) {
+  train_data[[col]][is.na(train_data[[col]])] <- train_medians[[col]]
+}
+# impute test
+for(col in names(train_medians)) {
+  if(col %in% colnames(test_data)) {
+    test_data[[col]][is.na(test_data[[col]])] <- train_medians[[col]]
+  }
+}
+# check
+sum(is.na(train_data))
+sum(is.na(test_data))
+```
+
+# Results
+
+Exploratory analysis was conducted to assess the suitability of ordinary least squares regression. 
+Since the focus is on predictive accuracy, diagnostic assessment prioritized multicollinearity, normality, and linearity on the untransformed training data. 
+
+```{r diagnostics, message = FALSE, warning = FALSE, echo = FALSE, results='hide', fig.show='hide'}
+# Remove UrbanPopulation
+train_data <- train_data %>% select(-UrbanPopulation)
+test_data <- test_data %>% select(-UrbanPopulation)
+
+train_numeric <- train_data %>% select(-Country) %>% select(where(is.numeric))
+lm_baseline <- lm(LifeExpectancy ~ . - Country, data = train_data)
+
+# Diagnostic 1: Multicollinearity
+vif_values <- vif(lm_baseline)
+
+# Diagnostic 2: Skewness
+skewness_values <- sapply(train_numeric, skewness, na.rm = TRUE)
+skewed_vars <- names(skewness_values[abs(skewness_values) > 1])
+
+most_skewed <- names(sort(abs(skewness_values), decreasing = TRUE)[1:6])
+dist_data <- train_numeric %>%
+  select(any_of(most_skewed)) %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value")
+
+# Diagnostic 3: Linearity
+plot(lm_baseline, which = 1)
+
+# Transformations
+logit_transform <- function(x) {
+  if(max(x, na.rm = TRUE) > 1) x <- x / 100
+  epsilon <- 0.001
+  x_adj <- pmax(pmin(x, 1 - epsilon), epsilon)
+  return(log(x_adj / (1 - x_adj)))
+}
+
+percentage_vars <- c("DiabetesPrevalence", "Immunization_DPT", "Immunization_HepB3", 
+                     "Immunization_Hib3", "Immunization_Measles", "Immunization_Pol3",
+                     "BasicWater", "BasicSanitation", "Overweight_Prev", "Hypertension_Prev",
+                     "TB_DeathRate", "TB_TreatmentSuccess", "Unemployment")
+
+continuous_skewed <- c("HealthExpenditure", "GovHealthExpend", "PrivHealthExpend",
+                       "GNI_PerCapita", "TB_Incidence", "LaborForce",
+                       "OutOfPocket_Expend", "Population_Total", "RuralPopulation")
+
+train_transformed <- train_data
+test_transformed <- test_data
+
+for(var in percentage_vars) {
+  if(var %in% colnames(train_transformed) && var %in% skewed_vars) {
+    train_transformed[[paste0(var, "_logit")]] <- logit_transform(train_transformed[[var]])
+    test_transformed[[paste0(var, "_logit")]] <- logit_transform(test_transformed[[var]])
+    train_transformed[[var]] <- NULL
+    test_transformed[[var]] <- NULL
+  }
+}
+
+for(var in continuous_skewed) {
+  if(var %in% colnames(train_transformed) && var %in% skewed_vars) {
+    train_transformed[[paste0(var, "_log")]] <- log(train_transformed[[var]] + 1)
+    test_transformed[[paste0(var, "_log")]] <- log(test_transformed[[var]] + 1)
+    train_transformed[[var]] <- NULL
+    test_transformed[[var]] <- NULL
+  }
+}
+
+# Create final data objects
+train_x <- train_transformed %>% select(-Country, -LifeExpectancy)
+train_y <- train_transformed$LifeExpectancy
+test_x <- test_transformed %>% select(-Country, -LifeExpectancy)
+test_y <- test_transformed$LifeExpectancy
+
+train_x_matrix <- as.matrix(train_x)
+train_y_vector <- as.numeric(train_y)
+test_x_matrix <- as.matrix(test_x)
+test_y_vector <- as.numeric(test_y)
+
+train_pcr_data <- data.frame(life_expectancy = train_y, train_x)
+test_pcr_data  <- data.frame(life_expectancy = test_y,  test_x)
+
+# Calculate post-transformation diagnostics
+train_numeric_transformed <- train_transformed %>% 
+  select(-Country, -LifeExpectancy) %>% 
+  select(where(is.numeric))
+skewness_after <- sapply(train_numeric_transformed, skewness, na.rm = TRUE)
+
+lm_transformed <- lm(LifeExpectancy ~ . - Country, data = train_transformed)
+vif_transformed <- vif(lm_transformed)
+```
+
+```{r correlation-plot, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=4, fig.cap="Correlation Plot"}
+cor_matrix <- cor(train_numeric, use = "complete.obs")
+cor_long <- melt(cor_matrix)
+colnames(cor_long) <- c("Var1", "Var2", "Correlation")
+
+ggplot(cor_long, aes(x = Var1, y = Var2, fill = Correlation)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_gradient2(low = "#2C5F8D", mid = "#F7F7F7", high = "#A63446", 
+                       midpoint = 0, limit = c(-1, 1)) +
+  theme_minimal() +
+  labs(x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6, color = "grey20"),
+        axis.text.y = element_text(size = 6, color = "grey20"),
+        panel.grid = element_blank(),
+        legend.title = element_text(size = 9))
+```
+
+As seen in Figure 1, multicollinearity is severe, with strong positive correlations among economic, health expenditure, infrastructure indicators, and clusters of demographic and immunization variables, clearly presenting that many predictors have overlapping information. Normality was violated, with 22 of 28 variables exhibiting |skewness| > 1. (Figure 2). Residual diagnostic plots also reveal violations of linearity. Log transformations were applied, and Table 1 demonstrates the effectiveness of these transformations: mean absolute skewness decreased from 2.32 to 0.40, and linearity improved (Figure 3). However, multicollinearity remained present, and in this moderate-to-high-dimensional setting, specialized methods are needed to prevent overfitting.
+
+```{r skew-table, echo=FALSE, message=FALSE, warning=FALSE, fig.width=12, fig.height=5, tab.cap="Data Summary Before and After Transformations"}
+
+summary_table <- data.frame(
+  Metric = c("Mean |Skewness|", 
+             "Mean VIF", "Variables with VIF > 10"),
+  Before = c(
+    round(mean(abs(skewness_values)), 2),
+    round(mean(vif_values), 2),
+    sum(vif_values > 10)
+  ),
+  After = c(
+    round(mean(abs(skewness_after)), 2),
+    round(mean(vif_transformed), 2),
+    sum(vif_transformed > 10)
+  )
+)
+
+kable(summary_table)
+```
+
+The Elastic Net regression model estimates coefficients by minimizing the following objective function:
+$$
+\min_{\beta_0,\,\boldsymbol{\beta}} 
+\left\{
+  \frac{1}{2n} \sum_{i=1}^n (y_i - \beta_0 - \mathbf{x}_i^\top \boldsymbol{\beta})^2
+  + \lambda \left[(1 - \alpha)\frac{1}{2}\|\boldsymbol{\beta}\|_2^2 + \alpha \|\boldsymbol{\beta}\|_1\right]
+\right\}
+$$
+After cross-validation, the optimal alpha is 0.58, which shows a balanced L1 (lasso) and L2 (ridge) penalization, combining variable selection with coefficient shrinkage to handle multicollinearity. Optimal regularization yielded at lambda_min = 0.213, which selected 17 of the 28 predictors. A more conservative penalty (lambda_1se = 1.985) retained only 6 variables, demonstrating the parsimony-accuracy trade-off (Table 4). Both specifications converged on the same core predictors (Table 5): demographic indicators (FertilityRate, SexRatio_Birth), infectious disease burden (TB_DeathRate), basic health infrastructure (BasicSanitation, BasicWater), and government health investment (GovHealthExpend). Increasing penalization from lambda_min to lambda_1se primarily removed secondary variables, giving a simpler representation. 
+
+```{r elastic-net, message = FALSE, warning = FALSE, echo = FALSE, results='hide', fig.show='hide'}
+set.seed(100)
+
+# cross-validation for alpha and lambda
+alpha_grid <- seq(0, 1, by = 0.01)
+cv_list <- vector("list", length(alpha_grid))  
+cv_min <- numeric(length(alpha_grid))        
+
+for (i in seq_along(alpha_grid)) {
+  cv_list[[i]] <- cv.glmnet(train_x_matrix, train_y_vector,
+                            family = "gaussian",
+                            alpha = alpha_grid[i],
+                            nfolds = 10,
+                            type.measure = "mse",
+                            standardize = TRUE)
+  cv_min[i] <- min(cv_list[[i]]$cvm)
+}
+
+# best alpha lambda
+best_i <- which.min(cv_min)
+best_alpha <- alpha_grid[best_i]
+
+best_lambda_min  <- cv_list[[best_i]]$lambda.min
+best_lambda_1se  <- cv_list[[best_i]]$lambda.1se
+
+cat("Best lambda min:", best_lambda_min)
+cat("Best lambda 1se:", best_lambda_1se)
+cat("Best alpha:", best_alpha)
+
+# model
+enet_min <- glmnet(
+  train_x_matrix, train_y_vector,
+  family = "gaussian",
+  alpha = best_alpha,
+  lambda = best_lambda_min,
+  standardize = TRUE
+)
+
+enet_1se <- glmnet(
+  train_x_matrix, train_y_vector,
+  family = "gaussian",
+  alpha = best_alpha,
+  lambda = best_lambda_1se,
+  standardize = TRUE
+)
+
+# Lambda.min model
+coef_min <- coef(enet_min, s = best_lambda_min)
+nz_min_idx <- which(coef_min != 0)
+nz_min_coef <- coef_min[nz_min_idx]
+vars_min <- rownames(coef_min)[nz_min_idx]
+num_vars_min <- length(vars_min) - 1  # exclude intercept
+
+# Lambda.1se model
+coef_1se <- coef(enet_1se, s = best_lambda_1se)
+nz_1se_idx <- which(coef_1se != 0)
+nz_1se_coef <- coef_1se[nz_1se_idx]
+vars_1se <- rownames(coef_1se)[nz_1se_idx]
+num_vars_1se <- length(vars_1se) - 1  # exclude intercept
+
+cat("\nElastic Net (lambda.min): kept", num_vars_min, "variables\n")
+cat("Elastic Net (lambda.1se): kept", num_vars_1se, "variables\n")
+
+# Top 5 variables lambda.min
+cat("\nTop variables (lambda.min):\n")
+coef_min_no_int <- nz_min_coef[-1]
+names(coef_min_no_int) <- vars_min[-1]
+print(head(sort(abs(coef_min_no_int), decreasing = TRUE), 5))
+
+# Top 5 variables lambda.1se
+cat("\nTop variables (lambda.1se):\n")
+coef_1se_no_int <- nz_1se_coef[-1]
+names(coef_1se_no_int) <- vars_1se[-1]
+print(head(sort(abs(coef_1se_no_int), decreasing = TRUE), 5))
+```
+
+Next, principal component analysis is applied to the 28 transformed predictors. The Principal Component Regression (PCR) model estimates coefficients by first projecting correlated predictors $\mathbf{X}$ onto orthogonal principal components and then regressing the response $\mathbf{y}$ on the first $k$ components, as follows:
+
+$$
+\hat{\boldsymbol{\beta}}_{\mathrm{PCR}(k)} 
+= \mathbf{P}_k (\mathbf{T}_k^\top \mathbf{T}_k)^{-1} \mathbf{T}_k^\top \mathbf{y}
+= \mathbf{P}_k (\mathbf{Z}_k^\top \mathbf{Z}_k)^{-1} \mathbf{Z}_k^\top \mathbf{y},
+\quad \text{where } \mathbf{Z}_k = \mathbf{X}\mathbf{P}_k.
+$$
+
+
+where $\mathbf{P}_k$ contains the loadings of the first $k$ principal components and $\mathbf{Z}_k$ the corresponding component scores. Figure 4 presents the scree plot, showing an elbow around components 4–5 where the marginal variance explained plateaus. Component selection criteria are consistent: Kaiser’s rule (eigenvalue > 1) and the 70% cumulative variance threshold both support retaining five components, which together explain 75.3% of total variance—balancing dimensionality reduction and information retention. A permutation test with 1,000 iterations (Figure 5) confirmed that the first four components capture genuine structure (eigenvalues > 95th%), while the fifth lies near the threshold, indicating marginal but interpretable structure. Bootstrap validation (1,000 resamples; Figure 6) showed stable eigenvalues for PC1–PC4 above Kaiser’s threshold, with PC5 generally remaining above it, again supporting its inclusion; PC6 reflected only noise. The bootstrap distribution of cumulative variance explained (Figure 7) indicated that five components account for a mean of 76.7% of total variance (95% CI: 74.5–79.0%), confirming robustness. Finally, sensitivity analysis (Table 6) comparing 3–5 component models demonstrated that the five-component solution achieved the best balance between predictive accuracy (RMSE = 2.669 years), justifying its selection as the final model.
+
+```{r pca, message = FALSE, warning = FALSE, echo = FALSE, results='hide', fig.show='hide'}
+# Perform PCA on TRAINING data
+pca_result <- prcomp(train_x, center = TRUE, scale. = TRUE)
+eigenvalues <- pca_result$sdev^2
+prop_var <- eigenvalues / sum(eigenvalues)
+cumvar <- cumsum(prop_var)
+
+# Scree plot
+plot(1:min(15, length(prop_var)), prop_var[1:min(15, length(prop_var))], 
+     type = "b", xlab = "Principal Component", ylab = "Proportion of Variance",
+     main = "Scree Plot", las = 1)
+
+# Kaiser's rule
+kaiser_components <- sum(eigenvalues > 1)
+cat("Kaiser's rule (eigenvalue > 1):", kaiser_components, "components\n")
+
+# VAF 70%
+n_comp_70 <- which(cumvar >= 0.7)[1]
+cat("70% variance threshold:", n_comp_70, "components\n")
+
+# Variance table
+variance_table <- data.frame(
+  PC = 1:min(10, length(prop_var)),
+  Variance = round(prop_var[1:min(10, length(prop_var))], 3),
+  Cumulative = round(cumvar[1:min(10, length(prop_var))], 3)
+)
+print(variance_table)
+```
+
+```{r permutation, message = FALSE, warning = FALSE, echo = FALSE, results='hide', fig.show='hide'}
+set.seed(100)
+
+# Get eigenvalues from PCA
+eigenvalues <- pca_result$sdev^2
+
+n_perm <- 1000
+perm_eigenvalues <- matrix(0, nrow = ncol(train_x), ncol = n_perm)
+
+for(i in 1:n_perm) {
+  perm_data <- apply(train_x, 2, sample)
+  perm_pca <- prcomp(perm_data, center = TRUE, scale. = TRUE)
+  perm_eigenvalues[, i] <- perm_pca$sdev^2
+}
+
+perm_threshold <- apply(perm_eigenvalues, 1, quantile, probs = 0.95)
+perm_components <- sum(eigenvalues > perm_threshold)
+cat("Permutation test suggests:", perm_components, "components\n")
+
+# Plot
+plot_data <- data.frame(
+  PC = rep(1:10, 2),
+  Eigenvalue = c(eigenvalues[1:10], perm_threshold[1:10]),
+  Type = rep(c("Observed", "Permuted (95%)"), each = 10)
+)
+
+ggplot(plot_data, aes(x = PC, y = Eigenvalue, color = Type)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("Observed" = "#A63446", "Permuted (95%)" = "#2C5F8D")) +
+  labs(title = "Permutation Test", x = "Component", y = "Eigenvalue") +
+  theme_minimal()
+```
+```{r bootstrap, message = FALSE, warning = FALSE, echo = FALSE, results='hide', fig.show='hide'}
+set.seed(100)
+B <- 1000
+n <- nrow(train_x)
+m <- ncol(train_x)
+k <- 5
+
+eigs.boot <- matrix(0, m, B)
+boot_var <- numeric(B)
+for (i in 1:B) {
+  samp_index <- sample(1:n, size = n, replace = TRUE)
+  boot_sample <- train_x[samp_index, ]
+  boot_pca <- prcomp(boot_sample, center = TRUE, scale. = TRUE)
+  
+  eigs.boot[, i] <- boot_pca$sdev^2
+  boot_var[i] <- sum((boot_pca$sdev[1:k]^2) / sum(boot_pca$sdev^2))
+}
+
+#boostrap kaiser
+eigenvalue_data <- as.data.frame(t(eigs.boot[1:k, ]))
+colnames(eigenvalue_data) <- paste0("PC", 1:k)
+eigenvalue_long <- melt(eigenvalue_data, 
+                        variable.name = "Component", 
+                        value.name = "Eigenvalue")
+
+ggplot(eigenvalue_long, aes(x = Component, y = Eigenvalue)) +
+  geom_boxplot(fill = "white", 
+               color = "black",
+               outlier.shape = 1,
+               outlier.color = "gray50",
+               width = 0.5) +
+  geom_hline(yintercept = 1, 
+             linetype = "dashed", 
+             color = "#A63446", 
+             linewidth = 0.8) +
+  annotate("text", 
+           x = 0.5,               
+           y = 1.35,                   
+           label = "Kaiser's Rule", 
+           color = "#A63446", 
+           size = 3.5,
+           hjust = 0,               
+           fontface = "italic") +
+  labs(title = "Bootstrap Kaiser's Rule Validation",
+       x = "Principal Component",
+       y = "Eigenvalue") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title = element_text(size = 11, face = "bold"),
+        axis.text = element_text(size = 10))
+
+# bootstrap vaf
+vaf_data <- data.frame(VAF = boot_var)
+boot_mean <- mean(boot_var)
+boot_ci <- quantile(boot_var, probs = c(0.025, 0.975))
+
+cat("Mean VAF:", round(boot_mean * 100, 2), "%\n")
+cat("95% CI: [", round(boot_ci[1] * 100, 2), "%, ", 
+    round(boot_ci[2] * 100, 2), "%]\n", sep = "")
+```
+```{r sensitivity, message = FALSE, warning = FALSE, echo = FALSE, results='hide', fig.show='hide'}
+k_values <- 3:5
+
+results <- data.frame(k = k_values, Test_RMSE = NA, Test_MAE = NA, VAF = NA)
+for (i in 1:length(k_values)) {
+  k <- k_values[i]
+  pcr_mod <- pcr(life_expectancy ~ ., data = train_pcr_data, ncomp = k, scale = TRUE)
+  pred <- predict(pcr_mod, newdata = test_pcr_data, ncomp = k)
+  
+  results$Test_RMSE[i] <- sqrt(mean((test_y - pred)^2))
+  results$Test_MAE[i] <- mean(abs(test_y - pred))
+  results$VAF[i] <- sum(pca_result$sdev[1:k]^2) / sum(pca_result$sdev^2)
+}
+print(results)
+
+pcr_final <- pcr(life_expectancy ~ ., data = train_pcr_data, ncomp = 5, scale = TRUE)
+```
+
+Figure 8 displays the top five variable loadings per component. Component 1 (40.6% of variance) captures a Healthcare Infrastructure and Economic Development dimension, with high loadings for government and total health expenditure, income, and access to sanitation and water, reflecting that wealthier health systems achieve stronger overall outcomes. Component 2 reflects Immunization Coverage with strong negative loadings for vaccination rates across DPT, Polio, Hib3, and HepB3, representing coordinated public health systems. Population Structure is represented by Component 3, which links lower prevalence of hypertension with larger labor forces and total populations, reflecting the effects of workforce composition and demographics. Component 4 captures Demographic Transitions, where declining population growth and urbanization align with economic maturation and rural-to-urban shifts. Finally, Component 5 combines Behavioral Health Risks, with high loadings for diabetes, alcohol consumption, and obesity, indicating lifestyle-related determinants of longevity. Together, these interpretable components confirm that PCR successfully extracted coherent latent dimensions summarizing correlated global health indicators. Notably, SexRatio_Birth—Elastic Net’s most influential predictor—was absent from PCR’s primary loadings, highlighting a key methodological difference: PCR uncovers structural patterns, whereas Elastic Net isolates specific actionable factors.
+
+```{r component-loadings, message = FALSE, warning = FALSE, echo = FALSE, results='hide', fig.show='hide'}
+final_k <- 5
+loadings_matrix <- pcr_final$loadings[, 1:final_k]
+
+for (i in 1:final_k) {
+  cat("\nComponent", i, ":\n")
+  
+  comp_loadings <- loadings_matrix[, i]
+  top_vars <- sort(abs(comp_loadings), decreasing = TRUE)[1:5]
+  top_names <- names(top_vars)
+  
+  for (var in top_names) {
+    cat(sprintf("  %-30s: %6.3f\n", var, comp_loadings[var]))
+  }
+}
+```
+
+```{r final-comparsion, message = FALSE, warning = FALSE, echo = FALSE, results='hide', fig.show='hide'}
+final_k <- 5
+
+# Training predictions
+train_pred_pcr <- as.numeric(predict(pcr_final, newdata = train_pcr_data, ncomp = final_k))
+train_rmse_pcr <- sqrt(mean((train_y - train_pred_pcr)^2))
+
+# Test predictions
+test_pred_pcr <- as.numeric(predict(pcr_final, newdata = test_pcr_data, ncomp = final_k))
+test_rmse_pcr <- sqrt(mean((test_y - test_pred_pcr)^2))
+test_mae_pcr <- mean(abs(test_y - test_pred_pcr))
+test_r2_pcr <- 1 - sum((test_y - test_pred_pcr)^2) / sum((test_y - mean(test_y))^2)
+
+
+# Adjusted R² for PCR
+n_test <- length(test_y)
+test_adjr2_pcr <- 1 - (1 - test_r2_pcr) * (n_test - 1) / (n_test - final_k - 1)
+
+# Test predictions
+test_pred_min  <- as.numeric(predict(enet_min,  newx = test_x_matrix, s = best_lambda_min))
+test_pred_1se  <- as.numeric(predict(enet_1se,  newx = test_x_matrix, s = best_lambda_1se))
+
+test_rmse_min <- sqrt(mean((test_y_vector - test_pred_min)^2))
+test_mae_min  <- mean(abs(test_y_vector - test_pred_min))
+test_r2_min   <- 1 - sum((test_y_vector - test_pred_min)^2) / sum((test_y_vector - mean(test_y_vector))^2)
+
+test_rmse_1se <- sqrt(mean((test_y_vector - test_pred_1se)^2))
+test_mae_1se  <- mean(abs(test_y_vector - test_pred_1se))
+test_r2_1se   <- 1 - sum((test_y_vector - test_pred_1se)^2) / sum((test_y_vector - mean(test_y_vector))^2)
+
+n_test <- length(test_y_vector)
+adjr2_min  <- 1 - (1 - test_r2_min)  * (n_test - 1) / (n_test - num_vars_min  - 1)
+adjr2_1se  <- 1 - (1 - test_r2_1se)  * (n_test - 1) / (n_test - num_vars_1se  - 1)
+```
+```{r performance-comparison, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=4, fig.cap="Model Performance Comparison"}
+comparison <- data.frame(
+  Model = c(
+    paste0("PCR (", final_k, " PCs)"), "Elastic Net (lambda.min)", "Elastic Net (lambda.1se)"
+  ),
+  Test_RMSE = c(test_rmse_pcr, test_rmse_min, test_rmse_1se
+  ),
+  Test_MAE = c(test_mae_pcr, test_mae_min, test_mae_1se
+  ),
+  Test_R2 = c(test_r2_pcr, test_r2_min, test_r2_1se
+  ),
+  Test_AdjR2 = c(test_adjr2_pcr, adjr2_min, adjr2_1se
+  ),
+  Parameters = c(
+    paste0(final_k, " PCs"),
+    paste0(num_vars_min, " vars"),
+    paste0(num_vars_1se, " vars")
+  )
+)
+
+kable(comparison, digits = 3, caption = "Model Performance Comparison")
+```
+```{r resid, message = FALSE, warning = FALSE, echo = FALSE, results='hide', fig.show='hide'}
+resid_df <- data.frame(
+  GNI_PerCapita = exp(test_x$GNI_PerCapita_log) - 1,  
+  pcr_resid = test_y - test_pred_pcr,
+  enet_min_resid = test_y - test_pred_min,
+  enet_1se_resid = test_y - test_pred_1se
+)
+
+pcr_stability    <- lm(pcr_resid ~ log(GNI_PerCapita), data = resid_df)
+enet_min_stab    <- lm(enet_min_resid ~ log(GNI_PerCapita), data = resid_df)
+enet_1se_stab    <- lm(enet_1se_resid ~ log(GNI_PerCapita), data = resid_df)
+
+stability_results <- data.frame(
+  Model = c("PCR Regression", "Elastic Net (lambda_min)", "Elastic Net (lambda_1se)"),
+  Slope = c(
+    round(summary(pcr_stability)$coefficients[2, 1], 4),
+    round(summary(enet_min_stab)$coefficients[2, 1], 4),
+    round(summary(enet_1se_stab)$coefficients[2, 1], 4)
+  ),
+  `p-value` = c(
+    formatC(summary(pcr_stability)$coefficients[2, 4], format = "e", digits = 2),
+    formatC(summary(enet_min_stab)$coefficients[2, 4], format = "e", digits = 2),
+    formatC(summary(enet_1se_stab)$coefficients[2, 4], format = "e", digits = 2)
+  )
+)
+```
+Table 2 shows test set performance across specifications. PCR (5 components) and Elastic Net (lambda_min) achieved nearly identical accuracy—RMSE of 2.669 vs. 2.644 years, both explaining roughly 89% of variance. The stricter Elastic Net (lambda_1se) specification trades accuracy (RMSE = 3.207) for simplicity. Though Elastic Net edged out PCR by 0.025 years, PCR achieves comparable performance using just 5 dimensions versus 17 separate predictors. To assess robustness across income levels, arguably the most importantly source of global health inequality [@WHO2025], prediction errors were regressed on log(GNI per capita). Table 7 shows that PCR residuals showed no income relationship (p = 0.604), while Elastic Net displayed increasing bias: mild at lambda_min (p = 0.345) but significant at lambda_1se (p = 0.002). PCR's near-zero slope (-0.17) indicates prediction errors remain constant regardless of national wealth, whereas Elastic Net's slopes (0.31 at lambda_min, 1.17 at lambda_1se) reveal systematic underprediction for wealthier nations and overprediction for poorer ones—a pattern that intensifies with stronger regularization. This makes PCR more generalizable for cross-country predictions. The five-component PCR model was therefore selected for predictions in the Netherlands, Kenya, and Colombia, spanning the global income spectrum.
+
+```{r 3-predictions, message = FALSE, warning = FALSE, echo = FALSE, results='hide', fig.show='hide'}
+pred_countries <- predictions_data$Country
+if("UrbanPopulation" %in% colnames(predictions_data)) {
+  predictions_data <- predictions_data %>% select(-UrbanPopulation)
+}
+pred_vars <- predictions_data[, !names(predictions_data) %in% c("Country")]
+
+# impute
+for(col in names(pred_vars)) {
+  if(col %in% names(train_medians)) {
+    na_idx <- is.na(pred_vars[[col]])
+    if(any(na_idx)) {
+      pred_vars[[col]][na_idx] <- train_medians[[col]]
+    }
+  }
+}
+
+pred_transformed <- pred_vars
+
+# logit
+for(var in percentage_vars) {
+  if(var %in% colnames(pred_transformed) && var %in% skewed_vars) {
+    pred_transformed[[paste0(var, "_logit")]] <- logit_transform(pred_transformed[[var]])
+    pred_transformed[[var]] <- NULL
+  }
+}
+
+# log
+for(var in continuous_skewed) {
+  if(var %in% colnames(pred_transformed) && var %in% skewed_vars) {
+    pred_transformed[[paste0(var, "_log")]] <- log(pred_transformed[[var]] + 1)
+    pred_transformed[[var]] <- NULL
+  }
+}
+
+# match columns to training data
+pred_transformed <- pred_transformed[, colnames(train_x)]
+
+pred_final <- predict(pcr_final, newdata = pred_transformed, ncomp = final_k)
+
+pred_values <- round(as.numeric(pred_final), 2)
+
+prediction_table <- data.frame(t(pred_values))
+colnames(prediction_table) <- pred_countries
+```
+```{r 3-predictions-table, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=4, fig.cap="Life Expectancy Predictions (PCR Model)"}
+kable(prediction_table,
+      caption = "Life Expectancy Predictions (PCR Model)",
+      digits = 2,
+      align = rep("c", ncol(prediction_table)))
+```
+
+The PCR model predicted life expectancy for the Netherlands (81.81 years), Kenya (64.42 years), and Colombia (74.83 years), spanning a 17-year range across income levels. PCR's income-invariant performance (p = 0.604) ensures equally reliable predictions from low-income Kenya to high-income Netherlands, which is essential for global health applications.
+
+
+# Conclusion
+
+This analysis identified high intercorrelations among life expectancy related and addressed two central questions: how to manage multicollinearity in health data and which factors most strongly predict life expectancy. Both principal component regression (PCR) and Elastic Net effectively mitigated severe multicollinearity and achieved comparable predictive accuracy; thus, the optimal method depends on analytical objectives: Elastic Net gives specific variable interpretability, identifying fertility rate, tuberculosis mortality, sanitation access, and government health expenditure as actionable variables for policy intervention. In contrast, PCR reveals broader latent dimensions integrating healthcare infrastructure, economic development, immunization coverage, demographic transition, and behavioral health risks. Although PCR exhibited a marginally higher RMSE, it demonstrated greater robustness across income levels. Elastic Net provides specific targets for within-country interventions, and PCR provides a stable framework for global benchmarking. Future research should expand this comparison to temporal forecasting to evaluate their predictive validity as life expectancy changes over time. The cross-sectional nature of this study restricts inferences to variations between countries, and the 5th principal component exhibited only slight structure, so careful interpretation is needed.
+
+# Appendix
+
+```{r most-skewed, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=4, fig.cap="Distribution of Most Skewed Variables"}
+ggplot(dist_data, aes(x = Value)) +
+  geom_histogram(bins = 30, fill = "#2C5F8D", color = "white", alpha = 0.7) +
+  facet_wrap(~Variable, scales = "free", ncol = 3) +
+  labs(x = "Value", y = "Frequency") +
+  theme_minimal() +
+  theme(strip.text = element_text(size = 10, color = "grey20"),
+        axis.text = element_text(color = "grey20"),
+        panel.grid.minor = element_blank())
+```
+
+```{r linearity, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=4, fig.cap="Linearity Before and After Transformations"}
+par(mfrow = c(1, 2))
+plot(lm_baseline, which = 1, main = "Before Transformations")
+plot(lm_transformed, which = 1, main = "After Transformations")
+par(mfrow = c(1, 1))
+```
+```{r alpha-lambda, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=4, fig.cap="Elastic Net Cross-Validation Results"}
+tuning_table <- data.frame(
+  Parameter = c("Alpha", "Lambda (min)", "Lambda (1-SE)"),
+  Value = c(round(best_alpha, 2),
+            round(best_lambda_min, 3),
+            round(best_lambda_1se, 3))
+)
+
+kable(
+  tuning_table,
+  caption = "Elastic Net Cross-Validation Results",
+  align = "lc",
+  digits = 3
+)
+```
+
+\clearpage
+\FloatBarrier
+
+```{r enet-variables, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=4, fig.cap="Elastic Net Model Comparison"}
+enet_summary <- data.frame(
+  Model = c("Elastic Net (lambda_min)", "Elastic Net (lambda_1se)"),
+  Lambda = c(0.21, 1.99),
+  Predictors = c(17, 6),
+  TopPredictors = c(
+    "SexRatio_Birth, FertilityRate, TB_DeathRate_logit, GovHealthExpend_log, BasicSanitation_logit",
+    "FertilityRate, TB_DeathRate_logit, BasicSanitation_logit, GovHealthExpend_log, BasicWater_logit"
+  )
+)
+knitr::kable(enet_summary,
+             caption = "Elastic Net Model Comparison")
+```
+
+```{r scree-plot, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=4, fig.cap="Eigenvalue Scree Plot of PCs"}
+plot(1:min(15, length(prop_var)), prop_var[1:min(15, length(prop_var))], 
+     type = "b", xlab = "Principal Component", ylab = "Proportion of Variance",
+     main = "Scree Plot", las = 1)
+```
+
+```{r permutation-plot, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=4, fig.cap="Permutation Test for Component Significance"}
+plot_data <- data.frame(
+  PC = rep(1:10, 2),
+  Eigenvalue = c(eigenvalues[1:10], perm_threshold[1:10]),
+  Type = rep(c("Observed", "Permuted (95%)"), each = 10)
+)
+
+ggplot(plot_data, aes(x = PC, y = Eigenvalue, color = Type)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("Observed" = "#A63446", "Permuted (95%)" = "#2C5F8D")) +
+  labs(title = "Permutation Test", x = "Component", y = "Eigenvalue") +
+  theme_minimal()
+```
+
+```{r boostrap-kaiser, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=4, fig.cap="Bootstrap Validation of Kaiser’s Rule"}
+ggplot(eigenvalue_long, aes(x = Component, y = Eigenvalue)) +
+  geom_boxplot(fill = "white", 
+               color = "black",
+               outlier.shape = 1,
+               outlier.color = "gray50",
+               width = 0.5) +
+  geom_hline(yintercept = 1, 
+             linetype = "dashed", 
+             color = "#A63446", 
+             linewidth = 0.8) +
+  annotate("text", 
+           x = 0.5,               
+           y = 1.35,                   
+           label = "Kaiser's Rule", 
+           color = "#A63446", 
+           size = 3.5,
+           hjust = 0,               
+           fontface = "italic") +
+  labs(title = "Bootstrap Kaiser's Rule Validation",
+       x = "Principal Component",
+       y = "Eigenvalue") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title = element_text(size = 11, face = "bold"),
+        axis.text = element_text(size = 10))
+```
+
+```{r boostrap-vaf, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=4, fig.cap="Bootstrap Distribution of Cumulative Variance Explained"}
+ggplot(vaf_data, aes(x = VAF)) +
+  geom_histogram(bins = 30, fill = "grey", 
+                 color = "#656565", alpha = 0.7) +
+  geom_vline(xintercept = boot_mean, color = "#A63446", linewidth = 0.8) +
+  geom_vline(xintercept = boot_ci, color = "black", 
+             linewidth = 0.5, linetype = "dashed") +
+  annotate("text", x = boot_mean, y = Inf, 
+           label = sprintf("Mean: %.1f%%", boot_mean * 100),
+           vjust = 2, color = "#A63446", fontface = "bold") +
+  labs(title = "Bootstrap VAF Distribution",
+       x = "Proportion of Variance Explained", 
+       y = "Frequency") +
+  scale_x_continuous(labels = scales::percent_format()) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+```{r sensitivity-plot, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=4, fig.cap="Sensitivity Analysis of PCR Performance"}
+results_table <- data.frame(
+  `Number of Components (k)` = results$k,
+  `Test RMSE` = round(results$Test_RMSE, 3),
+  `Test MAE` = round(results$Test_MAE, 3),
+  `Variance Explained (%)` = round(results$VAF * 100, 1)
+)
+
+kable(
+  results_table,
+  caption = "Sensitivity analysis of PCR performance across different numbers of components (k)"
+)
+```
+
+```{r component-loadings-plot, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=4, fig.cap="Top 5 Variable Loadings per Principal Component"}
+loadings_matrix <- pcr_final$loadings[, 1:k]
+
+# Convert loadings to tidy format
+loadings_long <- as.data.frame(loadings_matrix)
+loadings_long$Variable <- rownames(loadings_long)
+loadings_long <- tidyr::pivot_longer(
+  loadings_long, 
+  cols = starts_with("Comp"), 
+  names_to = "Component", 
+  values_to = "Loading"
+)
+
+# Keep top 5 per component
+top_loadings_long <- loadings_long |>
+  group_by(Component) |>
+  slice_max(order_by = abs(Loading), n = 5)
+
+# Plot
+ggplot(top_loadings_long, aes(x = reorder(Variable, Loading), y = Loading, fill = Loading > 0)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ Component, scales = "free_y") +
+  labs(
+    x = "Variable",
+    y = "Loading"
+  ) +
+  scale_fill_manual(values = c("#2C5F8D", "#A63446")) +
+  theme_minimal()
+```
+
+```{r gni, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=4, fig.cap="Stability Test of Prediction Errors Across Income Levels"}
+kable(
+  stability_results,
+  caption = "Stability Test of Prediction Errors Across Income Levels",
+  align = "lcc",
+  digits = 4
+)
+```
+
+```{r full-code, echo=TRUE, message=FALSE, eval=FALSE,warning=FALSE, error=TRUE, results='asis'}
+invisible(lapply(c("knitr","dplyr","glmnet","tidyr","ggplot2","corrplot","naniar",
+"car","lmtest","pls","reshape2","e1071"),require,character.only=TRUE))
+health_data<-read.csv("health_nutrition_population.csv",stringsAsFactors=FALSE)
+life_exp<-read.csv("life_expectancy_data-1.csv",stringsAsFactors=FALSE)
+predictions_data<-read.csv("predictions-1.csv",stringsAsFactors=FALSE)
+set.seed(100)
+train_index<-sample(1:nrow(full_data),0.8*nrow(full_data))
+train_data<-full_data[train_index,]; test_data<-full_data[-train_index,]
+numeric_cols<-sapply(train_data,is.numeric)
+numeric_cols["LifeExpectancy"]<-FALSE
+train_medians<-list()
+for(col in names(train_data)[numeric_cols]){
+ if(sum(is.na(train_data[[col]]))>0){
+  train_medians[[col]]<-median(train_data[[col]],na.rm=TRUE)}}
+for(col in names(train_medians)){
+ train_data[[col]][is.na(train_data[[col]])]<-train_medians[[col]]}
+for(col in names(train_medians)){
+ if(col%in%colnames(test_data)){
+  test_data[[col]][is.na(test_data[[col]])]<-train_medians[[col]]}}
+train_data<-train_data%>%select(-UrbanPopulation)
+test_data <-test_data %>%select(-UrbanPopulation)
+train_numeric<-train_data%>%select(-Country)%>%select(where(is.numeric))
+lm_baseline<-lm(LifeExpectancy~.-Country,data=train_data)
+vif_values<-vif(lm_baseline)
+skewness_values<-sapply(train_numeric,skewness,na.rm=TRUE)
+skewed_vars<-names(skewness_values[abs(skewness_values)>1])
+logit_transform<-function(x){
+ if(max(x,na.rm=TRUE)>1)x<-x/100
+ e<-0.001; x<-pmax(pmin(x,1-e),e); log(x/(1-x))}
+# Lists of percentage and continuous skewed variables used for log/logit transformations 
+# are omitted here for brevity; transformations followed the same procedure as in training.
+train_x<-train_transformed%>%select(-Country,-LifeExpectancy)
+train_y<-train_transformed$LifeExpectancy
+test_x <-test_transformed %>%select(-Country,-LifeExpectancy)
+test_y <-test_transformed $LifeExpectancy
+train_x_matrix<-as.matrix(train_x); train_y_vector<-as.numeric(train_y)
+test_x_matrix <-as.matrix(test_x);  test_y_vector <-as.numeric(test_y)
+train_pcr_data<-data.frame(life_expectancy=train_y,train_x)
+test_pcr_data <-data.frame(life_expectancy=test_y,test_x)
+lm_transformed<-lm(LifeExpectancy~.-Country,data=train_transformed)
+vif_transformed<-vif(lm_transformed)
+set.seed(100)
+alpha_grid<-seq(0,1,by=0.01)
+cv_list<-vector("list",length(alpha_grid))
+cv_min <-numeric(length(alpha_grid))
+for(i in seq_along(alpha_grid)){
+ cv_list[[i]]<-cv.glmnet(train_x_matrix,train_y_vector,
+  family="gaussian",alpha=alpha_grid[i],nfolds=10,
+  type.measure="mse",standardize=TRUE)
+ cv_min[i]<-min(cv_list[[i]]$cvm)}
+best_i<-which.min(cv_min)
+best_alpha<-alpha_grid[best_i]
+best_lambda_min <-cv_list[[best_i]]$lambda.min
+best_lambda_1se <-cv_list[[best_i]]$lambda.1se
+enet_min<-glmnet(train_x_matrix,train_y_vector,family="gaussian",
+ alpha=best_alpha,lambda=best_lambda_min,standardize=TRUE)
+enet_1se<-glmnet(train_x_matrix,train_y_vector,family="gaussian",
+ alpha=best_alpha,lambda=best_lambda_1se,standardize=TRUE)
+coef_min<-coef(enet_min,s=best_lambda_min)
+coef_1se<-coef(enet_1se,s=best_lambda_1se)
+nz_min_idx<-which(coef_min!=0); nz_1se_idx<-which(coef_1se!=0)
+nz_min_coef<-coef_min[nz_min_idx]; nz_1se_coef<-coef_1se[nz_1se_idx]
+vars_min<-rownames(coef_min)[nz_min_idx]
+vars_1se<-rownames(coef_1se)[nz_1se_idx]
+num_vars_min<-length(vars_min)-1
+num_vars_1se<-length(vars_1se)-1
+coef_min_no_int<-nz_min_coef[-1]; names(coef_min_no_int)<-vars_min[-1]
+coef_1se_no_int<-nz_1se_coef[-1]; names(coef_1se_no_int)<-vars_1se[-1]
+pca_result<-prcomp(train_x,center=TRUE,scale.=TRUE)
+eigenvalues<-pca_result$sdev^2
+prop_var<-eigenvalues/sum(eigenvalues)
+cumvar<-cumsum(prop_var)
+kaiser_components<-sum(eigenvalues>1)
+n_comp_70<-which(cumvar>=0.7)[1]
+set.seed(100)
+n_perm<-1000
+perm_eigenvalues<-matrix(0,nrow=ncol(train_x),ncol=n_perm)
+for(i in 1:n_perm){
+ perm_data<-apply(train_x,2,sample)
+ perm_pca<-prcomp(perm_data,center=TRUE,scale.=TRUE)
+ perm_eigenvalues[,i]<-perm_pca$sdev^2}
+perm_threshold<-apply(perm_eigenvalues,1,quantile,probs=0.95)
+perm_components<-sum(eigenvalues>perm_threshold)
+set.seed(100)
+B<-1000; n<-nrow(train_x); m<-ncol(train_x); k<-5
+eigs.boot<-matrix(0,m,B); boot_var<-numeric(B)
+for(i in 1:B){
+ samp_index<-sample(1:n,size=n,replace=TRUE)
+ boot_sample<-train_x[samp_index,]
+ boot_pca<-prcomp(boot_sample,center=TRUE,scale.=TRUE)
+ eigs.boot[,i]<-boot_pca$sdev^2
+ boot_var[i]<-sum((boot_pca$sdev[1:k]^2)/sum(boot_pca$sdev^2))}
+k_values<-3:5
+results<-data.frame(k=k_values,Test_RMSE=NA,Test_MAE=NA,VAF=NA)
+for(i in 1:length(k_values)){
+ k<-k_values[i]
+ pcr_mod<-pcr(life_expectancy~.,data=train_pcr_data,ncomp=k,scale=TRUE)
+ pred<-predict(pcr_mod,newdata=test_pcr_data,ncomp=k)
+ results$Test_RMSE[i]<-sqrt(mean((test_y-pred)^2))
+ results$Test_MAE[i] <-mean(abs(test_y-pred))
+ results$VAF[i]      <-sum(pca_result$sdev[1:k]^2)/sum(pca_result$sdev^2)}
+pcr_final<-pcr(life_expectancy~.,data=train_pcr_data,ncomp=5,scale=TRUE)
+final_k<-5
+loadings_matrix<-pcr_final$loadings[,1:final_k]
+for(i in 1:final_k){
+ comp_loadings<-loadings_matrix[,i]
+ top_vars<-sort(abs(comp_loadings),decreasing=TRUE)[1:5]
+ top_names<-names(top_vars)
+ for(v in top_names){
+  tmp<-comp_loadings[v]}}
+train_pred_pcr<-as.numeric(predict(pcr_final,newdata=train_pcr_data,
+ ncomp=final_k))
+test_pred_pcr <-as.numeric(predict(pcr_final,newdata=test_pcr_data,
+ ncomp=final_k))
+test_rmse_pcr<-sqrt(mean((test_y-test_pred_pcr)^2))
+test_mae_pcr <-mean(abs(test_y-test_pred_pcr))
+test_r2_pcr  <-1-sum((test_y-test_pred_pcr)^2)/
+ sum((test_y-mean(test_y))^2)
+n_test<-length(test_y)
+test_adjr2_pcr<-1-(1-test_r2_pcr)*(n_test-1)/(n_test-final_k-1)
+test_pred_min <-as.numeric(predict(enet_min,newx=test_x_matrix,
+ s=best_lambda_min))
+test_pred_1se <-as.numeric(predict(enet_1se,newx=test_x_matrix,
+ s=best_lambda_1se))
+test_rmse_min<-sqrt(mean((test_y_vector-test_pred_min)^2))
+test_mae_min <-mean(abs(test_y_vector-test_pred_min))
+test_r2_min  <-1-sum((test_y_vector-test_pred_min)^2)/
+ sum((test_y_vector-mean(test_y_vector))^2)
+test_rmse_1se<-sqrt(mean((test_y_vector-test_pred_1se)^2))
+test_mae_1se <-mean(abs(test_y_vector-test_pred_1se))
+test_r2_1se  <-1-sum((test_y_vector-test_pred_1se)^2)/
+ sum((test_y_vector-mean(test_y_vector))^2)
+n_test<-length(test_y_vector)
+adjr2_min<-1-(1-test_r2_min)*(n_test-1)/(n_test-num_vars_min-1)
+adjr2_1se<-1-(1-test_r2_1se)*(n_test-1)/(n_test-num_vars_1se-1)
+pcr_stability   <-lm(pcr_resid~log(GNI_PerCapita),data=resid_df)
+enet_min_stab   <-lm(enet_min_resid~log(GNI_PerCapita),data=resid_df)
+enet_1se_stab   <-lm(enet_1se_resid~log(GNI_PerCapita),data=resid_df)
+resid_df<-data.frame(
+  GNI_PerCapita = exp(test_x$GNI_PerCapita_log)-1,
+  pcr_resid     = test_y - test_pred_pcr,
+  enet_min_resid= test_y - test_pred_min,
+  enet_1se_resid= test_y - test_pred_1se
+)
+pred_transformed<-pred_transformed[,colnames(train_x)]
+pred_final<-predict(pcr_final,newdata=pred_transformed,ncomp=final_k)
+pred_values<-round(as.numeric(pred_final),2)
+prediction_table<-data.frame(t(pred_values))
+colnames(prediction_table)<-pred_countries
+```
+
+# References
